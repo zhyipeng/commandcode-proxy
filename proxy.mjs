@@ -2162,7 +2162,8 @@ function createResponsesTranslator(model, responseId, created) {
           if (!text) break;
           s += ensureStarted();
           reasoningSummary += text;
-          s += emit('response.reasoning_summary_text.delta', { type: 'response.reasoning_summary_text.delta', sequence_number: seq++, item_id: responseId, output_index: -1, content_index: -1, delta: text });
+          // output_index/content_index 必须为非负整数（客户端常以 u32 解析），-1 会导致 serde 反序列化失败
+          s += emit('response.reasoning_summary_text.delta', { type: 'response.reasoning_summary_text.delta', sequence_number: seq++, item_id: responseId, output_index: 0, content_index: 0, delta: text });
           break;
         }
 
