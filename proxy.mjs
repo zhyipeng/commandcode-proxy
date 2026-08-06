@@ -2118,7 +2118,7 @@ function createResponsesTranslator(model, responseId, created) {
     }
     let s = closeTextItem();
     if (reasoningSummary) {
-      s += emit('response.reasoning_summary_text.done', { type: 'response.reasoning_summary_text.done', sequence_number: seq++, summary: [{ type: 'summary_text', text: reasoningSummary }] });
+      s += emit('response.reasoning_summary_text.done', { type: 'response.reasoning_summary_text.done', sequence_number: seq++, item_id: responseId, output_index: 0, summary_index: 0, text: reasoningSummary });
     }
     const resp = buildResponseObject('completed');
     finalResponse = resp;
@@ -2162,8 +2162,8 @@ function createResponsesTranslator(model, responseId, created) {
           if (!text) break;
           s += ensureStarted();
           reasoningSummary += text;
-          // output_index/content_index 必须为非负整数（客户端常以 u32 解析），-1 会导致 serde 反序列化失败
-          s += emit('response.reasoning_summary_text.delta', { type: 'response.reasoning_summary_text.delta', sequence_number: seq++, item_id: responseId, output_index: 0, content_index: 0, delta: text });
+          // 官方 schema: item_id + output_index + summary_index + delta（索引必须为非负整数，客户端常以 u32 解析）
+          s += emit('response.reasoning_summary_text.delta', { type: 'response.reasoning_summary_text.delta', sequence_number: seq++, item_id: responseId, output_index: 0, summary_index: 0, delta: text });
           break;
         }
 
