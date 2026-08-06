@@ -1840,6 +1840,638 @@ function handleHealth(req, res) {
   res.end('OK');
 }
 
+// ── OpenAI Responses API (/v1/responses) 支持 ────────
+// 复用现有 CC 管线：Responses 请求 → OpenAI Chat 格式 → buildCcRequest → CC 上游
+// 输出侧：CC NDJSON → Responses SSE 事件流（流式）/ response 对象（非流式）
+
+// 提取 Responses content（字符串或数组）中的纯文本
+function extractResponsesText(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter(p => p && (p.type === 'text' || p.type === 'input_text' || p.type === 'output_text'))
+      .map(p => p.text || '')
+      .join('\n');
+  }
+  return '';
+}
+
+// 把 Responses content 转成 OpenAI 消息 content（string 或 image_url/text 数组）
+function convertResponsesContent(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return String(content || '');
+  const parts = [];
+  for (const p of content) {
+    if (!p) continue;
+    const type = p.type;
+    if (type === 'text' || type === 'input_text' || type === 'output_text') {
+      parts.push({ type: 'text', text: p.text || '' });
+    } else if (type === 'input_image') {
+      // Responses 图片格式: { type: "input_image", image_url: "data:..." }
+      parts.push({ type: 'image_url', image_url: { url: p.image_url || '' } });
+    } else if (type === 'image_url') {
+      parts.push({ type: 'image_url', image_url: { url: p.image_url?.url || '' } });
+    }
+  }
+  return parts;
+}
+
+// Responses 请求 → OpenAI Chat Completions 内部格式
+function convertResponsesToOpenAI(responsesReq) {
+  const instructions = [responsesReq.instructions];
+  const openaiMessages = [];
+  const toolNameFromCallId = {}; // call_id → function name（function_call 条目）
+
+  // input 可以是字符串（简化为单条 user 消息）或数组
+  const input = Array.isArray(responsesReq.input)
+    ? responsesReq.input
+    : (typeof responsesReq.input === 'string'
+        ? [{ type: 'message', role: 'user', content: responsesReq.input }]
+        : []);
+
+  // 第一遍：收集 system/developer 消息 + function_call 名称映射
+  for (const item of input) {
+    if (item && item.type === 'message') {
+      if (item.role === 'system' || item.role === 'developer') {
+        const text = extractResponsesText(item.content);
+        if (text) instructions.push(text);
+      }
+    } else if (item && item.type === 'function_call') {
+      if (item.call_id) toolNameFromCallId[item.call_id] = item.name || '';
+    }
+  }
+  const systemPrompt = instructions.filter(Boolean).join('\n').trim();
+  if (systemPrompt) openaiMessages.push({ role: 'system', content: systemPrompt });
+
+  // 第二遍：转换消息
+  for (const item of input) {
+    if (!item || !item.type) continue;
+    if (item.type === 'message') {
+      const role = item.role;
+      if (role === 'system' || role === 'developer') continue; // 已提取为 system
+      if (role === 'user') {
+        openaiMessages.push({ role: 'user', content: convertResponsesContent(item.content) });
+      } else if (role === 'assistant') {
+        // 提取文本（output_text/text），工具调用单独以 function_call 条目出现
+        const text = extractResponsesText(item.content);
+        openaiMessages.push({ role: 'assistant', content: text || null });
+      } else {
+        // tool/function 等兜底
+        openaiMessages.push({ role: 'user', content: convertResponsesContent(item.content) });
+      }
+    } else if (item.type === 'function_call') {
+      // 上一条 assistant 消息若存在则合并 tool_calls
+      const call = {
+        id: item.call_id || ('call_' + randomUUID().slice(0, 8)),
+        type: 'function',
+        function: {
+          name: item.name || '',
+          arguments: typeof item.arguments === 'string' ? item.arguments : JSON.stringify(item.arguments || {}),
+        },
+      };
+      const last = openaiMessages[openaiMessages.length - 1];
+      if (last && last.role === 'assistant') {
+        last.tool_calls = last.tool_calls || [];
+        last.tool_calls.push(call);
+      } else {
+        openaiMessages.push({ role: 'assistant', content: null, tool_calls: [call] });
+      }
+    } else if (item.type === 'function_call_output') {
+      openaiMessages.push({
+        role: 'tool',
+        tool_call_id: item.call_id,
+        name: toolNameFromCallId[item.call_id] || '',
+        content: typeof item.output === 'string' ? item.output : JSON.stringify(item.output || ''),
+      });
+    }
+  }
+
+  const openaiReq = {
+    model: responsesReq.model || 'deepseek/deepseek-v4-flash',
+    messages: openaiMessages,
+    max_tokens: responsesReq.max_output_tokens || 64000,
+    stream: responsesReq.stream === true,
+  };
+
+  // tools：Responses 扁平结构 → OpenAI function 嵌套结构
+  if (Array.isArray(responsesReq.tools) && responsesReq.tools.length > 0) {
+    const fnTools = responsesReq.tools.filter(t => t && (t.type === 'function' || (t.name && !t.type)));
+    if (fnTools.length > 0) {
+      openaiReq.tools = fnTools.map(t => ({
+        type: 'function',
+        function: {
+          name: t.name,
+          description: t.description || '',
+          parameters: t.parameters || { type: 'object', properties: {} },
+        },
+      }));
+    }
+  }
+
+  // tool_choice
+  if (responsesReq.tool_choice) {
+    const tc = responsesReq.tool_choice;
+    if (tc === 'auto' || tc === 'none' || tc === 'required') {
+      openaiReq.tool_choice = tc;
+    } else if (tc && tc.type === 'function') {
+      openaiReq.tool_choice = { type: 'function', function: { name: tc.name } };
+    } else if (tc && tc.name) {
+      openaiReq.tool_choice = { type: 'function', function: { name: tc.name } };
+    }
+  }
+
+  // 可选参数透传
+  if (responsesReq.temperature !== undefined) openaiReq.temperature = responsesReq.temperature;
+  if (responsesReq.top_p !== undefined) openaiReq.top_p = responsesReq.top_p;
+  if (responsesReq.parallel_tool_calls !== undefined) openaiReq.parallel_tool_calls = responsesReq.parallel_tool_calls;
+  if (responsesReq.stop) openaiReq.stop = responsesReq.stop;
+
+  // reasoning → reasoning_effort
+  if (responsesReq.reasoning && responsesReq.reasoning.effort) {
+    const effort = String(responsesReq.reasoning.effort);
+    if (effort === 'high') openaiReq.reasoning_effort = 'high';
+    else if (effort === 'medium') openaiReq.reasoning_effort = 'medium';
+    else if (effort === 'low') openaiReq.reasoning_effort = 'low';
+    else if (effort === 'minimal' || effort === 'none') openaiReq.reasoning_effort = 'low';
+  }
+
+  if (responsesReq.previous_response_id) {
+    log('warn', 'previous_response_id ignored (stateless proxy)', { previousResponseId: responsesReq.previous_response_id });
+  }
+
+  return openaiReq;
+}
+
+// 粗略估算文本的 token 数（用于 reasoning_tokens 兜底，CC 上游未提供精确值时）
+function estimateReasoningTokens(text) {
+  if (!text) return 0;
+  let cjk = 0;
+  let other = 0;
+  for (const ch of text) {
+    if (/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(ch)) cjk++;
+    else other++;
+  }
+  // CJK 每字约 0.75 token，其它字符约 4 字符 = 1 token
+  return Math.max(0, Math.round(cjk * 0.75 + other / 4));
+}
+
+// CC NDJSON → Responses SSE 事件流（流式）/ response 对象（非流式）
+function createResponsesTranslator(model, responseId, created) {
+  let seq = 0;
+  let messageItemId = null;    // 当前打开的 message item
+  let currentOutputIndex = 0;  // 下一个 output item 的 index
+  let textBlockOpen = false;
+  let textBuffer = '';
+  let reasoningSummary = '';
+  let reasoningTokens = 0;     // 优先用上游精确值，否则本地估算
+  let finishReason = null;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cachedInputTokens = 0;
+  const output = [];      // 完整 output 数组（message + function_call）
+  let started = false;
+  let completed = false;
+  let finalResponse = null;
+
+  function emit(type, data) {
+    return `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+  }
+
+  function ensureStarted() {
+    if (started) return '';
+    started = true;
+    const resp = {
+      id: responseId, object: 'response', created_at: created, status: 'in_progress',
+      model, output: [], parallel_tool_calls: true, previous_response_id: null,
+    };
+    return emit('response.created', { type: 'response.created', sequence_number: seq++, response: resp })
+      + emit('response.in_progress', { type: 'response.in_progress', sequence_number: seq++, response: resp });
+  }
+
+  function openTextItem() {
+    if (textBlockOpen) return '';
+    textBlockOpen = true;
+    messageItemId = 'msg_' + randomUUID().slice(0, 12);
+    const item = { id: messageItemId, type: 'message', status: 'in_progress', role: 'assistant', content: [] };
+    let s = emit('response.output_item.added', { type: 'response.output_item.added', sequence_number: seq++, output_index: currentOutputIndex, item });
+    s += emit('response.content_part.added', { type: 'response.content_part.added', sequence_number: seq++, item_id: messageItemId, output_index: currentOutputIndex, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } });
+    return s;
+  }
+
+  function closeTextItem() {
+    if (!textBlockOpen) return '';
+    textBlockOpen = false;
+    const text = textBuffer;
+    let s = emit('response.output_text.done', { type: 'response.output_text.done', sequence_number: seq++, item_id: messageItemId, output_index: currentOutputIndex, content_index: 0, text });
+    s += emit('response.content_part.done', { type: 'response.content_part.done', sequence_number: seq++, item_id: messageItemId, output_index: currentOutputIndex, content_index: 0, part: { type: 'output_text', text, annotations: [] } });
+    const item = { id: messageItemId, type: 'message', status: 'completed', role: 'assistant', content: text ? [{ type: 'output_text', text, annotations: [] }] : [] };
+    output.push(item);
+    s += emit('response.output_item.done', { type: 'response.output_item.done', sequence_number: seq++, output_index: currentOutputIndex, item });
+    currentOutputIndex++;
+    messageItemId = null;
+    return s;
+  }
+
+  function handleToolCall(event) {
+    const id = event.toolCallId || ('call_' + randomUUID().slice(0, 8));
+    const name = event.toolName || '';
+    const args = typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {});
+    const fcId = 'fc_' + randomUUID().slice(0, 12);
+    let s = closeTextItem(); // 关闭已打开的文本块
+    const item = { id: fcId, type: 'function_call', status: 'completed', call_id: id, name, arguments: args };
+    s += emit('response.output_item.added', { type: 'response.output_item.added', sequence_number: seq++, output_index: currentOutputIndex, item });
+    output.push(item);
+    s += emit('response.output_item.done', { type: 'response.output_item.done', sequence_number: seq++, output_index: currentOutputIndex, item });
+    currentOutputIndex++;
+    return s;
+  }
+
+  function buildResponseObject(status) {
+    const resp = {
+      id: responseId, object: 'response', created_at: created, status,
+      model, output, parallel_tool_calls: true, previous_response_id: null,
+      usage: {
+        input_tokens: inputTokens,
+        input_tokens_details: { cached_tokens: cachedInputTokens },
+        output_tokens: outputTokens,
+        output_tokens_details: { reasoning_tokens: Math.min(reasoningTokens, outputTokens) },
+        total_tokens: inputTokens + outputTokens,
+      },
+    };
+    if (reasoningSummary) {
+      resp.reasoning = { effort: null, summary: [{ type: 'summary_text', text: reasoningSummary }] };
+    }
+    return resp;
+  }
+
+  function finish(event) {
+    if (event.finishReason) finishReason = mapFinishReason(event.finishReason);
+    const u = event.totalUsage || event.usage;
+    if (u) {
+      normalizeUsage(u);
+      inputTokens = u.inputTokens ?? inputTokens;
+      outputTokens = u.outputTokens ?? outputTokens;
+      cachedInputTokens = u.cachedInputTokens ?? cachedInputTokens;
+      // 优先取上游精确 reasoning token 数，否则估算
+      reasoningTokens = u.reasoningTokens ?? u.outputTokenDetails?.reasoningTokens ?? 0;
+      if (!reasoningTokens) reasoningTokens = estimateReasoningTokens(reasoningSummary);
+    }
+    let s = closeTextItem();
+    if (reasoningSummary) {
+      s += emit('response.reasoning_summary_text.done', { type: 'response.reasoning_summary_text.done', sequence_number: seq++, summary: [{ type: 'summary_text', text: reasoningSummary }] });
+    }
+    const resp = buildResponseObject('completed');
+    finalResponse = resp;
+    s += emit('response.completed', { type: 'response.completed', sequence_number: seq++, response: resp });
+    completed = true;
+    return s;
+  }
+
+  return {
+    lastCcEvent: '',
+    get inputTokens() { return inputTokens; },
+    get outputTokens() { return outputTokens; },
+    get cachedInputTokens() { return cachedInputTokens; },
+
+    parseLine(line) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed === '[DONE]' || trimmed.startsWith(':')) return null;
+
+      let event;
+      try { event = JSON.parse(trimmed); } catch { return null; }
+      if (!event.type) return null;
+      this.lastCcEvent = event.type;
+
+      let s = '';
+      switch (event.type) {
+        case 'text-start': case 'reasoning-start': case 'start': case 'start-step':
+          break;
+
+        case 'text-delta': {
+          const text = event.text || event.delta || '';
+          if (!text) break;
+          s += ensureStarted();
+          s += openTextItem();
+          textBuffer += text;
+          s += emit('response.output_text.delta', { type: 'response.output_text.delta', sequence_number: seq++, item_id: messageItemId, output_index: currentOutputIndex, content_index: 0, delta: text });
+          break;
+        }
+
+        case 'reasoning-delta': {
+          const text = event.text || '';
+          if (!text) break;
+          s += ensureStarted();
+          reasoningSummary += text;
+          s += emit('response.reasoning_summary_text.delta', { type: 'response.reasoning_summary_text.delta', sequence_number: seq++, item_id: responseId, output_index: -1, content_index: -1, delta: text });
+          break;
+        }
+
+        case 'tool-call': {
+          s += ensureStarted();
+          s += handleToolCall(event);
+          break;
+        }
+
+        case 'finish-step': {
+          if (event.finishReason) finishReason = mapFinishReason(event.finishReason);
+          break;
+        }
+
+        case 'finish': {
+          s += ensureStarted();
+          s += finish(event);
+          break;
+        }
+
+        case 'error': {
+          log('warn', 'CC stream error (responses)', { message: event.error?.message || event.message });
+          break;
+        }
+
+        case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
+          break;
+
+        default:
+          break;
+      }
+
+      return s ? [s] : null;
+    },
+
+    getDoneEvent() {
+      return 'data: [DONE]\n\n';
+    },
+
+    getResponseObject() {
+      if (!completed) finish({});
+      return finalResponse;
+    },
+  };
+}
+
+async function handleResponses(req, res) {
+  let responsesReq;
+  try {
+    responsesReq = await readBody(req);
+  } catch {
+    sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+    return;
+  }
+
+  const apiKey = getApiKey(req.headers);
+  if (!apiKey) {
+    sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'auth_error' } });
+    return;
+  }
+
+  const stream = responsesReq.stream === true;
+  const model = responsesReq.model || 'deepseek/deepseek-v4-flash';
+  const responseId = `resp_${randomUUID().slice(0, 12)}`;
+  const created = nowUnix();
+
+  // Responses → OpenAI → CC
+  const openaiReq = convertResponsesToOpenAI(responsesReq);
+  const ccBody = buildCcRequest(openaiReq);
+
+  const abortController = new AbortController();
+  let aborted = false;
+  const startTime = Date.now();
+  let bytesReceived = 0; let lastCcEvent = ''; let keepaliveCount = 0;
+  let reader = null;
+  let translator = null;
+
+  try {
+    await ensureInitialized(apiKey, abortController.signal);
+    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
+
+    if (!ccResponse.ok) {
+      const errorText = await ccResponse.text().catch(() => '');
+      log('error', 'CC API error (responses)', { status: ccResponse.status });
+      const mapped = mapCcError(ccResponse.status, errorText);
+      sendJSON(res, mapped.status, mapped.body);
+      return;
+    }
+
+    // 下游断连检测：打断 CC 上游 + 记录日志
+    res.on('close', () => {
+      if (res.writableEnded) return; // Normal completion, not a disconnect
+      aborted = true;
+      abortController.signal.aborted || log('warn', 'Client disconnected', {
+        path: '/v1/responses',
+        model, responseId, streaming: stream,
+        elapsedMs: Date.now() - startTime,
+        bytesSent: bytesReceived,
+        lastCcEvent: lastCcEvent || '(none)',
+        keepaliveCount,
+        inputTokens: translator?.inputTokens ?? 0,
+        outputTokens: translator?.outputTokens ?? 0,
+        cachedInputTokens: translator?.cachedInputTokens ?? 0,
+      });
+      if (!abortController.signal.aborted) {
+        try { abortController.abort(); } catch {}
+      }
+    });
+
+    if (stream) {
+      // ── 流式 Responses SSE ──
+      translator = createResponsesTranslator(model, responseId, created);
+      let buffer = '';
+      let started = false; // 延迟写 200 header，超时/output=0 时返回 JSON 429/502 让 SDK 自动重试
+      const decoder = new TextDecoder();
+      reader = ccResponse.body.getReader();
+
+      try {
+        while (true) {
+          const result = await Promise.race([
+            reader.read(),
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), STREAM_IDLE_TIMEOUT_MS)
+            ),
+          ]);
+          const { done, value } = result;
+          if (done) break;
+          if (aborted) break;
+          bytesReceived += value.length;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          let hadOutput = false;
+          for (const line of lines) {
+            const events = translator.parseLine(line);
+            if (events) {
+              if (!started) {
+                res.writeHead(200, {
+                  'Content-Type': 'text/event-stream',
+                  'Cache-Control': 'no-cache',
+                  'Connection': 'keep-alive',
+                  'X-Accel-Buffering': 'no',
+                });
+                started = true;
+              }
+              for (const evt of events) res.write(evt);
+              hadOutput = true;
+            }
+            if (translator.lastCcEvent) lastCcEvent = translator.lastCcEvent;
+          }
+          // silent events 期间发 keepalive，防止客户端超时断开
+          if (started && !hadOutput) { try { res.write(': keepalive\n\n'); keepaliveCount++; } catch {} }
+        }
+
+        if (!aborted) {
+          consecutiveTimeouts = 0;
+          if (buffer.trim()) {
+            const events = translator.parseLine(buffer);
+            if (events) {
+              if (!started) started = true;
+              for (const evt of events) res.write(evt);
+            }
+          }
+          // 输出 token 为 0 时记为错误，避免下游异常计费
+          if (translator.outputTokens === 0) {
+            try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
+            if (!started) {
+              sendJSON(res, 429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 });
+              return;
+            }
+            try { res.write(`data: ${JSON.stringify({ type: 'error', error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 })}\n\n`); } catch {}
+          } else {
+            if (!started) {
+              res.writeHead(200, {
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+                'X-Accel-Buffering': 'no',
+              });
+              started = true;
+            }
+            res.write(translator.getDoneEvent());
+          }
+        }
+      } catch (e) {
+        if (aborted) {
+          // 客户端已断连，只清理（close handler 已调用 abortController.abort()）
+          try { reader.cancel(); } catch {}
+        } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
+          log('warn', 'Stream idle timeout', {
+            path: '/v1/responses',
+            model, streaming: true, timeoutMs: STREAM_IDLE_TIMEOUT_MS,
+            elapsedMs: Date.now() - startTime, id: responseId,
+            bytesReceived, lastCcEvent: lastCcEvent || '(none)', keepaliveCount,
+            inputTokens: translator.inputTokens,
+            outputTokens: translator.outputTokens,
+            cachedInputTokens: translator.cachedInputTokens,
+          });
+          try { reader.cancel(); } catch {}
+          try { abortController.abort(); } catch {} // 打断 CC 上游，避免浪费 token
+          consecutiveTimeouts++;
+          const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
+            ? 'Response timeout - try reducing context length (summarize earlier messages)'
+            : 'Response timeout - request timed out';
+          if (!started) {
+            sendJSON(res, 429, { error: { message: timeoutMsg, type: 'rate_limit_error', input_tokens: 0 }, retry_after: 5 });
+            return;
+          }
+          if (!res.writableEnded) {
+            try { res.write(`data: ${JSON.stringify({ type: 'error', error: { message: timeoutMsg, type: 'rate_limit_error' }, retry_after: 5 })}\n\n`); } catch {}
+            try { res.destroy(); } catch {}
+          }
+        } else {
+          log('error', 'Responses stream error', { message: e.message });
+          try { abortController.abort(); } catch {} // 打断 CC 上游
+          if (!started) {
+            sendJSON(res, 502, { error: { message: `Upstream error: ${e.message}`, type: 'proxy_error', input_tokens: 0 }, retry_after: 10 });
+            return;
+          }
+          if (!res.writableEnded) {
+            try { res.write(`data: ${JSON.stringify({ type: 'error', error: { message: e.message, type: 'proxy_error' } })}\n\n`); } catch {}
+          }
+        }
+      }
+
+      if (!res.writableEnded) res.end();
+    } else {
+      // ── 非流式 Responses JSON（复用同一 translator 组装 response 对象）──
+      translator = createResponsesTranslator(model, responseId, created);
+      reader = ccResponse.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+
+      const processLines = () => {
+        const lines = buf.split('\n');
+        buf = lines.pop() || '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed === '[DONE]' || trimmed.startsWith(':')) continue;
+          try {
+            const event = JSON.parse(trimmed);
+            if (!event.type) continue;
+            lastCcEvent = event.type;
+            translator.parseLine(line);
+          } catch {}
+        }
+      };
+
+      while (true) {
+        const result = await Promise.race([
+          reader.read(),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), NONSTREAM_IDLE_TIMEOUT_MS)
+          ),
+        ]);
+        const { done, value } = result;
+        if (done) break;
+        bytesReceived += value.length;
+        buf += decoder.decode(value, { stream: true });
+        processLines();
+      }
+      processLines();
+
+      // 输出 token 为 0 时记为错误，避免下游异常计费
+      if (translator.outputTokens === 0) {
+        try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
+        sendJSON(res, 429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 });
+        return;
+      }
+
+      consecutiveTimeouts = 0;
+      sendJSON(res, 200, translator.getResponseObject());
+    }
+  } catch (e) {
+    if (abortController.signal.aborted) {
+      log('warn', 'Request cancelled (client disconnected before CC response)', {
+        path: '/v1/responses',
+        model,
+        responseId,
+      });
+    } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
+      log('warn', 'Stream idle timeout', {
+        path: '/v1/responses',
+        model,
+        streaming: false,
+        timeoutMs: NONSTREAM_IDLE_TIMEOUT_MS,
+        elapsedMs: Date.now() - startTime,
+        id: responseId,
+        bytesReceived,
+        lastCcEvent: lastCcEvent || '(none)',
+      });
+      try { reader?.cancel(); } catch {}
+      try { abortController.abort(); } catch {} // 打断 CC 上游
+      consecutiveTimeouts++;
+      const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
+        ? 'Response timeout - try reducing context length (summarize earlier messages)'
+        : 'Response timeout - request timed out';
+      res.setHeader('Retry-After', '5');
+      sendJSON(res, 429, { error: { message: timeoutMsg, type: 'rate_limit_error', input_tokens: 0 }, retry_after: 5 });
+    } else {
+      log('error', 'Upstream error', { message: e.message });
+      try { abortController.abort(); } catch {} // 打断 CC 上游
+      sendJSON(res, 502, { error: { message: `Upstream error: ${e.message}`, type: 'proxy_error', input_tokens: 0 }, retry_after: 10 });
+    }
+  }
+}
+
 // ── 服务器 ──────────────────────────────────────────
 
 const server = http.createServer(async (req, res) => {
@@ -1861,6 +2493,8 @@ const server = http.createServer(async (req, res) => {
       await handleChatCompletions(req, res);
     } else if (url.pathname === '/v1/messages' && req.method === 'POST') {
       await handleMessages(req, res);
+    } else if (url.pathname === '/v1/responses' && req.method === 'POST') {
+      await handleResponses(req, res);
     } else if (url.pathname === '/v1/models' && req.method === 'GET') {
       await handleModels(req, res);
     } else if (url.pathname === '/health' || url.pathname === '/') {

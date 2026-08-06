@@ -6,7 +6,7 @@
 
 基于对官方 CLI 网络流量的分析，精确还原了 Command Code API 的请求协议（含设备指纹与生命周期预请求），并实现了多层兼容适配。
 
-**完整功能**：OpenAI Chat Completions + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止） | 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志
+**完整功能**：OpenAI Chat Completions + Anthropic Messages API + OpenAI Responses API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止） | 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志
 
 **社区**: [Linux.do](https://linux.do) — 一个友好的中文技术社区。
 
@@ -233,6 +233,69 @@ data: {"type":"message_stop"}
   }
 }
 ```
+
+### `POST /v1/responses`
+
+OpenAI Responses API 兼容端点。支持流式和非流式、工具调用、多模态图片输入、推理强度。
+
+**请求体参数：**
+
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| `model` | 是 | 模型 ID（见模型列表） |
+| `input` | 是 | 字符串或数组：`message`（role 可为 `user`/`assistant`/`system`/`developer`）、`function_call`、`function_call_output` |
+| `instructions` | 否 | 系统级指令（自动转为 `system` 消息） |
+| `max_output_tokens` | 否 | 最大生成 token（默认 64000） |
+| `stream` | 否 | 是否 SSE 流式（默认 false） |
+| `temperature` / `top_p` | 否 | 采样参数 |
+| `tools` | 否 | 工具定义（Responses 扁平格式 `{type, name, description, parameters}`） |
+| `tool_choice` | 否 | `auto`/`none`/`required` 或 `{type:"function", name}` |
+| `reasoning` | 否 | `{effort: "low"/"medium"/"high"}` 自动映射为 `reasoning_effort` |
+| `parallel_tool_calls` | 否 | 是否允许并行工具调用 |
+
+> 注意：`previous_response_id` 会被忽略——代理是无状态代理，续接对话请把完整历史放在 `input` 里传入。
+
+**简单请求：**
+```json
+{
+  "model": "deepseek/deepseek-v4-flash",
+  "input": [{ "type": "message", "role": "user", "content": "hello" }],
+  "stream": true
+}
+```
+
+**多轮工具调用**：把上一轮的 `function_call` 和 `function_call_output` 条目追加到 `input` 即可续接工具循环。
+
+**非流式响应：**
+```json
+{
+  "id": "resp_xxx",
+  "object": "response",
+  "created_at": 1234567890,
+  "status": "completed",
+  "model": "deepseek/deepseek-v4-flash",
+  "output": [
+    { "type": "message", "id": "msg_xxx", "status": "completed", "role": "assistant",
+      "content": [{ "type": "output_text", "text": "Hello!", "annotations": [] }] },
+    { "type": "function_call", "id": "fc_xxx", "status": "completed",
+      "call_id": "call_xxx", "name": "get_weather", "arguments": "{\"location\":\"北京\"}" }
+  ],
+  "parallel_tool_calls": true,
+  "previous_response_id": null,
+  "reasoning": { "effort": null, "summary": [{ "type": "summary_text", "text": "..." }] },
+  "usage": {
+    "input_tokens": 7558,
+    "input_tokens_details": { "cached_tokens": 7552 },
+    "output_tokens": 42,
+    "output_tokens_details": { "reasoning_tokens": 20 },
+    "total_tokens": 7600
+  }
+}
+```
+
+**流式（SSE）** 按标准 Responses 事件序列输出：`response.created` → `response.in_progress` → `response.reasoning_summary_text.delta` → `response.output_item.added` → `response.content_part.added` → `response.output_text.delta`* → `response.output_text.done` → `response.content_part.done` → `response.output_item.done` → `response.reasoning_summary_text.done` → `response.completed`，以 `data: [DONE]` 结束。
+
+> `usage.output_tokens_details.reasoning_tokens`：若 CC 上游返回精确的 reasoning token 数则透传；否则按 `reasoning` 文本本地估算（clamp 不超过 `output_tokens`）。
 
 ### `GET /v1/models`
 

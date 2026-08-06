@@ -6,7 +6,7 @@ A reverse proxy that converts Command Code API to OpenAI / Anthropic compatible 
 
 Built by analyzing official CLI network traffic to accurately replicate the Command Code API request protocol, including device-fingerprint and lifecycle pre-requests.
 
-**Features**: OpenAI Chat Completions + Anthropic Messages API | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Device fingerprint disguise (per-key, auto-refresh) | `x-api-key` auth (Anthropic SDK) | Client disconnect detection with upstream abort | Zero-output → 429 auto-retry | Consecutive timeout → 429 auto-retry | Privacy-aware logging
+**Features**: OpenAI Chat Completions + Anthropic Messages API + OpenAI Responses API | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Device fingerprint disguise (per-key, auto-refresh) | `x-api-key` auth (Anthropic SDK) | Client disconnect detection with upstream abort | Zero-output → 429 auto-retry | Consecutive timeout → 429 auto-retry | Privacy-aware logging
 
 **Community**: [Linux.do](https://linux.do) — a friendly Chinese tech community.
 
@@ -233,6 +233,69 @@ data: {"type":"message_stop"}
   }
 }
 ```
+
+### `POST /v1/responses`
+
+OpenAI Responses API compatible endpoint. Supports streaming and non-streaming, tool calling, multi-modal image input, and reasoning effort.
+
+**Request body parameters:**
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `model` | yes | Model ID (see model list) |
+| `input` | yes | String or array of input items: `message` (role `user`/`assistant`/`system`/`developer`), `function_call`, `function_call_output` |
+| `instructions` | no | System-level instructions (mapped to a `system` message) |
+| `max_output_tokens` | no | Max generated tokens (default 64000) |
+| `stream` | no | SSE streaming (default false) |
+| `temperature` / `top_p` | no | Sampling params |
+| `tools` | no | Function tools in Responses flat format (`{type, name, description, parameters}`) |
+| `tool_choice` | no | `auto`/`none`/`required` or `{type:"function", name}` |
+| `reasoning` | no | `{effort: "low"/"medium"/"high"}` mapped to `reasoning_effort` |
+| `parallel_tool_calls` | no | Allow parallel tool calls |
+
+> Note: `previous_response_id` is ignored — this is a stateless proxy; send the full conversation history in `input` instead.
+
+**Simple request:**
+```json
+{
+  "model": "deepseek/deepseek-v4-flash",
+  "input": [{ "type": "message", "role": "user", "content": "hello" }],
+  "stream": true
+}
+```
+
+**Multi-turn tool use:** append the previous `function_call` and `function_call_output` items to `input` to continue a tool loop.
+
+**Non-streaming response:**
+```json
+{
+  "id": "resp_xxx",
+  "object": "response",
+  "created_at": 1234567890,
+  "status": "completed",
+  "model": "deepseek/deepseek-v4-flash",
+  "output": [
+    { "type": "message", "id": "msg_xxx", "status": "completed", "role": "assistant",
+      "content": [{ "type": "output_text", "text": "Hello!", "annotations": [] }] },
+    { "type": "function_call", "id": "fc_xxx", "status": "completed",
+      "call_id": "call_xxx", "name": "get_weather", "arguments": "{\"location\":\"Beijing\"}" }
+  ],
+  "parallel_tool_calls": true,
+  "previous_response_id": null,
+  "reasoning": { "effort": null, "summary": [{ "type": "summary_text", "text": "..." }] },
+  "usage": {
+    "input_tokens": 7558,
+    "input_tokens_details": { "cached_tokens": 7552 },
+    "output_tokens": 42,
+    "output_tokens_details": { "reasoning_tokens": 20 },
+    "total_tokens": 7600
+  }
+}
+```
+
+**Streaming (SSE)** emits standard Responses events: `response.created` → `response.in_progress` → `response.reasoning_summary_text.delta` → `response.output_item.added` → `response.content_part.added` → `response.output_text.delta`* → `response.output_text.done` → `response.content_part.done` → `response.output_item.done` → `response.reasoning_summary_text.done` → `response.completed`, ending with `data: [DONE]`.
+
+> `usage.output_tokens_details.reasoning_tokens`: passthrough when CC upstream returns an exact reasoning token count; otherwise estimated locally from the `reasoning` text (clamped to `output_tokens`).
 
 ### `GET /v1/models`
 
