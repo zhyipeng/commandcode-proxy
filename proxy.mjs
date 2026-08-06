@@ -2098,9 +2098,9 @@ function createResponsesTranslator(model, responseId, created) {
         total_tokens: inputTokens + outputTokens,
       },
     };
-    if (reasoningSummary) {
-      resp.reasoning = { effort: null, summary: [{ type: 'summary_text', text: reasoningSummary }] };
-    }
+    // 注意：不在 response 对象里输出 reasoning.summary —— 某些客户端将其定义为
+    // string/map 联合类型，数组会导致 "invalid type: sequence, expected string or map"。
+    // 推理文本仍通过 response.reasoning_summary_text.delta/done 流式事件输出。
     return resp;
   }
 
